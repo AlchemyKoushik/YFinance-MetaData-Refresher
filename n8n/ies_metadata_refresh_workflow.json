@@ -1,0 +1,420 @@
+{
+  "name": "IES Metadata Refresh",
+  "nodes": [
+    {
+      "id": "75887392-b578-44c8-8780-4bb0f9e18697",
+      "name": "Every Saturday",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [0, 0],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [6],
+              "triggerAtHour": 6,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "68c0c781-ef85-4b9f-ae83-1293685c1bda",
+      "name": "POST Refresh Service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [240, 0],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.IES_METADATA_REFRESH_URL + '/refresh' }}",
+        "sendBody": false,
+        "options": {
+          "timeout": 1800000,
+          "redirect": {
+            "followRedirects": true,
+            "maxRedirects": 3
+          },
+          "response": {
+            "fullResponse": true,
+            "neverError": true,
+            "responseFormat": "json"
+          }
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "82083f62-3109-4fcb-b52a-f7bcb88e75a8",
+      "name": "Validate JSON",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [480, 0],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "status-code",
+              "name": "statusCode",
+              "type": "number",
+              "value": "={{ $json.statusCode }}"
+            },
+            {
+              "id": "status",
+              "name": "status",
+              "type": "string",
+              "value": "={{ $json.body.status }}"
+            },
+            {
+              "id": "processed",
+              "name": "processed",
+              "type": "number",
+              "value": "={{ $json.body.processed }}"
+            },
+            {
+              "id": "inserted",
+              "name": "inserted",
+              "type": "number",
+              "value": "={{ $json.body.inserted }}"
+            },
+            {
+              "id": "updated",
+              "name": "updated",
+              "type": "number",
+              "value": "={{ $json.body.updated }}"
+            },
+            {
+              "id": "failed",
+              "name": "failed",
+              "type": "number",
+              "value": "={{ $json.body.failed }}"
+            },
+            {
+              "id": "duration-seconds",
+              "name": "durationSeconds",
+              "type": "number",
+              "value": "={{ $json.body.duration_seconds }}"
+            },
+            {
+              "id": "message",
+              "name": "message",
+              "type": "string",
+              "value": "={{ $json.body.message }}"
+            },
+            {
+              "id": "response",
+              "name": "response",
+              "type": "object",
+              "value": "={{ $json.body }}"
+            },
+            {
+              "id": "is-success",
+              "name": "isSuccess",
+              "type": "boolean",
+              "value": "={{ $json.statusCode === 200 && $json.body?.status === 'success' && ($json.body?.failed ?? 1) === 0 }}"
+            }
+          ]
+        },
+        "options": {
+          "dotNotation": true,
+          "includeBinary": true,
+          "ignoreConversionErrors": false,
+          "stripBinary": true
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "18e83968-223c-4761-84b0-b2278f06cd70",
+      "name": "Check Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [720, 0],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "success"
+            },
+            {
+              "leftValue": "={{ $json.failed }}",
+              "operator": {
+                "type": "number",
+                "operation": "smallerEqual"
+              },
+              "rightValue": 0
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "ignoreCase": true,
+          "looseTypeValidation": false
+        }
+      }
+    },
+    {
+      "id": "70740def-665f-4209-8a72-66f1f99916b4",
+      "name": "Generate Success Summary",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [960, -120],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "summary-status",
+              "name": "status",
+              "type": "string",
+              "value": "success"
+            },
+            {
+              "id": "summary-message",
+              "name": "message",
+              "type": "string",
+              "value": "={{ $json.message ?? 'Metadata refresh completed successfully' }}"
+            },
+            {
+              "id": "summary-response",
+              "name": "response",
+              "type": "object",
+              "value": "={{ $json.response }}"
+            },
+            {
+              "id": "summary-processed",
+              "name": "processed",
+              "type": "number",
+              "value": "={{ $json.processed }}"
+            },
+            {
+              "id": "summary-inserted",
+              "name": "inserted",
+              "type": "number",
+              "value": "={{ $json.inserted }}"
+            },
+            {
+              "id": "summary-updated",
+              "name": "updated",
+              "type": "number",
+              "value": "={{ $json.updated }}"
+            },
+            {
+              "id": "summary-failed",
+              "name": "failed",
+              "type": "number",
+              "value": "={{ $json.failed }}"
+            },
+            {
+              "id": "summary-duration",
+              "name": "durationSeconds",
+              "type": "number",
+              "value": "={{ $json.durationSeconds }}"
+            }
+          ]
+        },
+        "options": {
+          "dotNotation": true,
+          "includeBinary": true,
+          "ignoreConversionErrors": false,
+          "stripBinary": true
+        }
+      }
+    },
+    {
+      "id": "084e2fa7-5e44-439c-9749-67baa09ddb81",
+      "name": "Generate Failure Summary",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [960, 120],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "failure-status",
+              "name": "status",
+              "type": "string",
+              "value": "failed"
+            },
+            {
+              "id": "failure-message",
+              "name": "message",
+              "type": "string",
+              "value": "={{ $json.message ?? ($json.error?.message ?? $json.error ?? 'Metadata refresh failed') }}"
+            },
+            {
+              "id": "failure-response",
+              "name": "response",
+              "type": "object",
+              "value": "={{ (() => { const response = $json.response ?? $json.body; if (response && typeof response === 'object') return response; const error = $json.error; if (error && typeof error === 'object') return error; return { error: String($json.message ?? $json.error ?? 'Metadata refresh failed') }; })() }}"
+            },
+            {
+              "id": "failure-processed",
+              "name": "processed",
+              "type": "number",
+              "value": "={{ $json.processed ?? 0 }}"
+            },
+            {
+              "id": "failure-inserted",
+              "name": "inserted",
+              "type": "number",
+              "value": "={{ $json.inserted ?? 0 }}"
+            },
+            {
+              "id": "failure-updated",
+              "name": "updated",
+              "type": "number",
+              "value": "={{ $json.updated ?? 0 }}"
+            },
+            {
+              "id": "failure-failed",
+              "name": "failed",
+              "type": "number",
+              "value": "={{ $json.failed ?? 1 }}"
+            },
+            {
+              "id": "failure-duration",
+              "name": "durationSeconds",
+              "type": "number",
+              "value": "={{ $json.durationSeconds ?? 0 }}"
+            }
+          ]
+        },
+        "options": {
+          "dotNotation": true,
+          "includeBinary": true,
+          "ignoreConversionErrors": false,
+          "stripBinary": true
+        }
+      }
+    },
+    {
+      "id": "4567448f-7b5e-41c4-a163-e009cdca179f",
+      "name": "Finish",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1200, 0],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Every Saturday": {
+      "main": [
+        [
+          {
+            "node": "POST Refresh Service",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST Refresh Service": {
+      "main": [
+        [
+          {
+            "node": "Validate JSON",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate Failure Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate JSON": {
+      "main": [
+        [
+          {
+            "node": "Check Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate Failure Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Success": {
+      "main": [
+        [
+          {
+            "node": "Generate Success Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate Failure Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Success Summary": {
+      "main": [
+        [
+          {
+            "node": "Finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Failure Summary": {
+      "main": [
+        [
+          {
+            "node": "Finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "versionId": "1",
+  "tags": [],
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp"
+  }
+}
