@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
 
 import asyncpg
 
+from app.catalog import CatalogCompany
+from app.time_utils import utc_now
 from app.yfinance_client import FetchResult
+
+
+REFRESH_LOCK_KEY = int.from_bytes(hashlib.sha256(b"ies_metadata_refresh_lock").digest()[:8], "big") & ((1 << 63) - 1)
 
 
 CREATE_COMPANY_METADATA_SQL = """
@@ -23,6 +31,11 @@ CREATE TABLE IF NOT EXISTS public.ies_company_metadata (
     currency text NOT NULL DEFAULT '',
     revenue_ttm numeric,
     market_cap numeric,
+    last_successful_refresh timestamptz,
+    last_refresh_attempt timestamptz,
+    refresh_status text NOT NULL DEFAULT 'never',
+    last_error_message text,
+    refresh_duration_ms integer,
     last_updated timestamptz NOT NULL DEFAULT now()
 )
 """
@@ -33,19 +46,49 @@ CREATE TABLE IF NOT EXISTS public.ies_refresh_log (
     run_id uuid PRIMARY KEY,
     started_at timestamptz NOT NULL,
     finished_at timestamptz NOT NULL,
+    duration_ms integer NOT NULL DEFAULT 0,
     processed integer NOT NULL DEFAULT 0,
     inserted integer NOT NULL DEFAULT 0,
     updated integer NOT NULL DEFAULT 0,
+    skipped integer NOT NULL DEFAULT 0,
     failed integer NOT NULL DEFAULT 0,
-    duration_seconds numeric(12,3) NOT NULL DEFAULT 0,
+    total_api_calls integer NOT NULL DEFAULT 0,
+    validation_warnings integer NOT NULL DEFAULT 0,
+    field_update_reasons jsonb NOT NULL DEFAULT '[]'::jsonb,
     status text NOT NULL
 )
+"""
+
+
+ALTER_COMPANY_METADATA_SQL = """
+ALTER TABLE public.ies_company_metadata
+    ADD COLUMN IF NOT EXISTS last_successful_refresh timestamptz,
+    ADD COLUMN IF NOT EXISTS last_refresh_attempt timestamptz,
+    ADD COLUMN IF NOT EXISTS refresh_status text NOT NULL DEFAULT 'never',
+    ADD COLUMN IF NOT EXISTS last_error_message text,
+    ADD COLUMN IF NOT EXISTS refresh_duration_ms integer
+"""
+
+
+ALTER_REFRESH_LOG_SQL = """
+ALTER TABLE public.ies_refresh_log
+    ADD COLUMN IF NOT EXISTS duration_ms integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS skipped integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_api_calls integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS validation_warnings integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS field_update_reasons jsonb NOT NULL DEFAULT '[]'::jsonb
 """
 
 
 CREATE_INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS ies_company_metadata_last_updated_idx
     ON public.ies_company_metadata (last_updated DESC);
+
+CREATE INDEX IF NOT EXISTS ies_company_metadata_last_refresh_attempt_idx
+    ON public.ies_company_metadata (last_refresh_attempt DESC);
+
+CREATE INDEX IF NOT EXISTS ies_company_metadata_refresh_status_idx
+    ON public.ies_company_metadata (refresh_status);
 
 CREATE INDEX IF NOT EXISTS ies_refresh_log_started_at_idx
     ON public.ies_refresh_log (started_at DESC);
@@ -55,75 +98,50 @@ CREATE INDEX IF NOT EXISTS ies_refresh_log_status_idx
 """
 
 
-UPSERT_METADATA_SQL = """
-INSERT INTO public.ies_company_metadata (
-    ticker,
-    company_name,
-    sector,
-    industry,
-    country,
-    region,
-    exchange,
-    currency,
-    revenue_ttm,
-    market_cap,
-    last_updated
-) VALUES (
-    $1,
-    COALESCE($2, $1),
-    COALESCE($3, ''),
-    COALESCE($4, ''),
-    COALESCE($5, ''),
-    COALESCE($6, ''),
-    COALESCE($7, ''),
-    COALESCE($8, ''),
-    $9,
-    $10,
-    $11
-)
-ON CONFLICT (ticker) DO UPDATE SET
-    company_name = EXCLUDED.company_name,
-    sector = EXCLUDED.sector,
-    industry = EXCLUDED.industry,
-    country = EXCLUDED.country,
-    region = EXCLUDED.region,
-    exchange = EXCLUDED.exchange,
-    currency = EXCLUDED.currency,
-    revenue_ttm = EXCLUDED.revenue_ttm,
-    market_cap = EXCLUDED.market_cap,
-    last_updated = EXCLUDED.last_updated
-RETURNING (xmax = 0) AS inserted
-"""
+@dataclass(slots=True)
+class CompanyMetadataRow:
+    ticker: str
+    company_name: str
+    sector: str
+    industry: str
+    country: str
+    region: str
+    exchange: str
+    currency: str
+    revenue_ttm: Decimal | int | float | None
+    market_cap: Decimal | int | float | None
+    last_successful_refresh: datetime | None
+    last_refresh_attempt: datetime | None
+    refresh_status: str
+    last_error_message: str | None
+    refresh_duration_ms: int | None
+    last_updated: datetime
 
 
-INSERT_REFRESH_LOG_SQL = """
-INSERT INTO public.ies_refresh_log (
-    run_id,
-    started_at,
-    finished_at,
-    processed,
-    inserted,
-    updated,
-    failed,
-    duration_seconds,
-    status
-) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9
-)
-"""
+@dataclass(slots=True)
+class CompanyRefreshOutcome:
+    inserted: bool
+    updated_fields: list[str]
+    skipped_fields: list[str]
+    validation_warnings: list[str]
+    field_update_reasons: list[str]
+
+    @property
+    def changed(self) -> bool:
+        return self.inserted or bool(self.updated_fields)
 
 
-UPDATE_REFRESH_LOG_SQL = """
-UPDATE public.ies_refresh_log
-SET finished_at = $2,
-    processed = $3,
-    inserted = $4,
-    updated = $5,
-    failed = $6,
-    duration_seconds = $7,
-    status = $8
-WHERE run_id = $1
-"""
+@dataclass(slots=True)
+class RefreshLockHandle:
+    pool: asyncpg.Pool
+    connection: asyncpg.Connection
+    lock_key: int
+
+    async def release(self) -> None:
+        try:
+            await self.connection.execute("SELECT pg_advisory_unlock($1)", self.lock_key)
+        finally:
+            await self.pool.release(self.connection)
 
 
 @dataclass(slots=True)
@@ -131,12 +149,36 @@ class RefreshLogEntry:
     run_id: UUID
     started_at: datetime
     finished_at: datetime
+    duration_ms: int
     processed: int
     inserted: int
     updated: int
+    skipped: int
     failed: int
-    duration_seconds: Decimal
+    total_api_calls: int
+    validation_warnings: int
+    field_update_reasons: list[str]
     status: str
+
+
+FIELD_SPECS: list[tuple[str, str, str]] = [
+    ("company_name", "company_name", "text"),
+    ("sector", "sector", "text"),
+    ("industry", "industry", "text"),
+    ("country", "country", "text"),
+    ("region", "region", "text"),
+    ("exchange", "exchange", "text"),
+    ("currency", "currency", "text"),
+    ("revenue_ttm", "revenue_ttm", "numeric"),
+    ("market_cap", "market_cap", "numeric"),
+]
+
+
+def _clean_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return None
 
 
 class DatabaseService:
@@ -170,7 +212,9 @@ class DatabaseService:
         pool = self._require_pool()
         async with pool.acquire() as connection:
             await connection.execute(CREATE_COMPANY_METADATA_SQL)
+            await connection.execute(ALTER_COMPANY_METADATA_SQL)
             await connection.execute(CREATE_REFRESH_LOG_SQL)
+            await connection.execute(ALTER_REFRESH_LOG_SQL)
             await connection.execute(CREATE_INDEXES_SQL)
 
     async def ping(self) -> None:
@@ -197,71 +241,108 @@ class DatabaseService:
             transaction = connection.transaction()
             await transaction.start()
             try:
-                first = await connection.fetchrow(
-                    UPSERT_METADATA_SQL,
-                    "__ies_validation__",
-                    "Validation First",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    1,
-                    1,
-                    datetime.now(timezone.utc),
+                now = utc_now()
+                first = await self._apply_company_refresh_on_connection(
+                    connection,
+                    FetchResult(
+                        ticker="__ies_validation__",
+                        attempts=1,
+                        catalog_company_name="Validation First",
+                        started_at=now,
+                        finished_at=now,
+                        duration_ms=1,
+                        company_name="Validation First",
+                        sector=None,
+                        industry=None,
+                        country=None,
+                        region=None,
+                        exchange=None,
+                        currency=None,
+                        revenue_ttm=Decimal("1"),
+                        market_cap=Decimal("1"),
+                        last_updated=now,
+                    ),
+                    started_at=now,
+                    finished_at=now,
+                    duration_ms=1,
                 )
-                second = await connection.fetchrow(
-                    UPSERT_METADATA_SQL,
-                    "__ies_validation__",
-                    "Validation Second",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    2,
-                    2,
-                    datetime.now(timezone.utc),
+                second = await self._apply_company_refresh_on_connection(
+                    connection,
+                    FetchResult(
+                        ticker="__ies_validation__",
+                        attempts=1,
+                        catalog_company_name="Validation Second",
+                        started_at=now,
+                        finished_at=now,
+                        duration_ms=1,
+                        company_name="Validation Second",
+                        sector=None,
+                        industry=None,
+                        country=None,
+                        region=None,
+                        exchange=None,
+                        currency=None,
+                        revenue_ttm=Decimal("2"),
+                        market_cap=Decimal("2"),
+                        last_updated=now,
+                    ),
+                    started_at=now,
+                    finished_at=now,
+                    duration_ms=1,
                 )
                 if not first or not second:
                     raise RuntimeError("UPSERT verification failed")
             finally:
                 await transaction.rollback()
 
-    async def upsert_company(self, record: FetchResult) -> bool:
+    async def acquire_refresh_lock(self) -> RefreshLockHandle | None:
         pool = self._require_pool()
-        async with pool.acquire() as connection:
-            row = await connection.fetchrow(
-                UPSERT_METADATA_SQL,
-                record.ticker,
-                record.company_name,
-                record.sector,
-                record.industry,
-                record.country,
-                record.region,
-                record.exchange,
-                record.currency,
-                record.revenue_ttm,
-                record.market_cap,
-                record.last_updated,
-            )
-            return bool(row["inserted"])
+        connection = await pool.acquire()
+        try:
+            locked = await connection.fetchval("SELECT pg_try_advisory_lock($1)", REFRESH_LOCK_KEY)
+            if locked:
+                return RefreshLockHandle(pool=pool, connection=connection, lock_key=REFRESH_LOCK_KEY)
+            await pool.release(connection)
+            return None
+        except Exception:
+            await pool.release(connection)
+            raise
 
     async def insert_refresh_log(self, entry: RefreshLogEntry) -> None:
         pool = self._require_pool()
         async with pool.acquire() as connection:
             await connection.execute(
-                INSERT_REFRESH_LOG_SQL,
+                """
+                INSERT INTO public.ies_refresh_log (
+                    run_id,
+                    started_at,
+                    finished_at,
+                    duration_ms,
+                    processed,
+                    inserted,
+                    updated,
+                    skipped,
+                    failed,
+                    total_api_calls,
+                    validation_warnings,
+                    field_update_reasons,
+                    status
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13
+                )
+                """,
                 entry.run_id,
                 entry.started_at,
                 entry.finished_at,
+                entry.duration_ms,
                 entry.processed,
                 entry.inserted,
                 entry.updated,
+                entry.skipped,
                 entry.failed,
-                entry.duration_seconds,
+                entry.total_api_calls,
+                entry.validation_warnings,
+                json.dumps(entry.field_update_reasons),
                 entry.status,
             )
 
@@ -269,13 +350,463 @@ class DatabaseService:
         pool = self._require_pool()
         async with pool.acquire() as connection:
             await connection.execute(
-                UPDATE_REFRESH_LOG_SQL,
+                """
+                UPDATE public.ies_refresh_log
+                SET finished_at = $2,
+                    duration_ms = $3,
+                    processed = $4,
+                    inserted = $5,
+                    updated = $6,
+                    skipped = $7,
+                    failed = $8,
+                    total_api_calls = $9,
+                    validation_warnings = $10,
+                    field_update_reasons = $11::jsonb,
+                    status = $12
+                WHERE run_id = $1
+                """,
                 entry.run_id,
                 entry.finished_at,
+                entry.duration_ms,
                 entry.processed,
                 entry.inserted,
                 entry.updated,
+                entry.skipped,
                 entry.failed,
-                entry.duration_seconds,
+                entry.total_api_calls,
+                entry.validation_warnings,
+                json.dumps(entry.field_update_reasons),
                 entry.status,
             )
+
+    async def apply_company_refresh(
+        self,
+        record: FetchResult,
+        *,
+        started_at: datetime,
+        finished_at: datetime,
+        duration_ms: int,
+    ) -> CompanyRefreshOutcome:
+        pool = self._require_pool()
+        async with pool.acquire() as connection:
+            transaction = connection.transaction()
+            await transaction.start()
+            try:
+                outcome = await self._apply_company_refresh_on_connection(
+                    connection,
+                    record,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_ms=duration_ms,
+                )
+                await transaction.commit()
+                return outcome
+            except Exception:
+                await transaction.rollback()
+                raise
+
+    async def record_company_failure(
+        self,
+        company: CatalogCompany,
+        *,
+        error_message: str,
+        started_at: datetime,
+        finished_at: datetime,
+        duration_ms: int,
+    ) -> CompanyRefreshOutcome:
+        pool = self._require_pool()
+        async with pool.acquire() as connection:
+            transaction = connection.transaction()
+            await transaction.start()
+            try:
+                outcome = await self._record_company_failure_on_connection(
+                    connection,
+                    company,
+                    error_message=error_message,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_ms=duration_ms,
+                )
+                await transaction.commit()
+                return outcome
+            except Exception:
+                await transaction.rollback()
+                raise
+
+    async def _fetch_company_row(self, connection: asyncpg.Connection, ticker: str) -> CompanyMetadataRow | None:
+        row = await connection.fetchrow(
+            """
+            SELECT
+                ticker,
+                company_name,
+                sector,
+                industry,
+                country,
+                region,
+                exchange,
+                currency,
+                revenue_ttm,
+                market_cap,
+                last_successful_refresh,
+                last_refresh_attempt,
+                refresh_status,
+                last_error_message,
+                refresh_duration_ms,
+                last_updated
+            FROM public.ies_company_metadata
+            WHERE ticker = $1
+            FOR UPDATE
+            """,
+            ticker,
+        )
+        if row is None:
+            return None
+        return CompanyMetadataRow(
+            ticker=row["ticker"],
+            company_name=row["company_name"],
+            sector=row["sector"],
+            industry=row["industry"],
+            country=row["country"],
+            region=row["region"],
+            exchange=row["exchange"],
+            currency=row["currency"],
+            revenue_ttm=row["revenue_ttm"],
+            market_cap=row["market_cap"],
+            last_successful_refresh=row["last_successful_refresh"],
+            last_refresh_attempt=row["last_refresh_attempt"],
+            refresh_status=row["refresh_status"],
+            last_error_message=row["last_error_message"],
+            refresh_duration_ms=row["refresh_duration_ms"],
+            last_updated=row["last_updated"],
+        )
+
+    async def _apply_company_refresh_on_connection(
+        self,
+        connection: asyncpg.Connection,
+        record: FetchResult,
+        *,
+        started_at: datetime,
+        finished_at: datetime,
+        duration_ms: int,
+    ) -> CompanyRefreshOutcome:
+        existing = await self._fetch_company_row(connection, record.ticker)
+        merged, updated_fields, skipped_fields, validation_warnings, field_update_reasons = self._merge_company_values(
+            existing,
+            record,
+        )
+
+        company_name = merged["company_name"]
+        if existing is None:
+            await connection.execute(
+                """
+                INSERT INTO public.ies_company_metadata (
+                    ticker,
+                    company_name,
+                    sector,
+                    industry,
+                    country,
+                    region,
+                    exchange,
+                    currency,
+                    revenue_ttm,
+                    market_cap,
+                    last_successful_refresh,
+                    last_refresh_attempt,
+                    refresh_status,
+                    last_error_message,
+                    refresh_duration_ms,
+                    last_updated
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+                )
+                """,
+                record.ticker,
+                company_name,
+                merged["sector"],
+                merged["industry"],
+                merged["country"],
+                merged["region"],
+                merged["exchange"],
+                merged["currency"],
+                merged["revenue_ttm"],
+                merged["market_cap"],
+                finished_at,
+                started_at,
+                "success" if updated_fields else "unchanged",
+                None,
+                duration_ms,
+                finished_at if updated_fields else started_at,
+            )
+            return CompanyRefreshOutcome(
+                inserted=True,
+                updated_fields=[field for field in updated_fields if field in merged],
+                skipped_fields=skipped_fields,
+                validation_warnings=validation_warnings,
+                field_update_reasons=field_update_reasons,
+            )
+
+        update_columns: list[str] = []
+        update_values: list[Any] = []
+        for column, value in merged.items():
+            if column == "company_name":
+                if value != existing.company_name:
+                    update_columns.append("company_name")
+                    update_values.append(value)
+            elif column == "sector":
+                if value != existing.sector:
+                    update_columns.append("sector")
+                    update_values.append(value)
+            elif column == "industry":
+                if value != existing.industry:
+                    update_columns.append("industry")
+                    update_values.append(value)
+            elif column == "country":
+                if value != existing.country:
+                    update_columns.append("country")
+                    update_values.append(value)
+            elif column == "region":
+                if value != existing.region:
+                    update_columns.append("region")
+                    update_values.append(value)
+            elif column == "exchange":
+                if value != existing.exchange:
+                    update_columns.append("exchange")
+                    update_values.append(value)
+            elif column == "currency":
+                if value != existing.currency:
+                    update_columns.append("currency")
+                    update_values.append(value)
+            elif column == "revenue_ttm":
+                if value != existing.revenue_ttm:
+                    update_columns.append("revenue_ttm")
+                    update_values.append(value)
+            elif column == "market_cap":
+                if value != existing.market_cap:
+                    update_columns.append("market_cap")
+                    update_values.append(value)
+
+        refresh_status = "success" if update_columns else "unchanged"
+        if update_columns:
+            update_columns.extend(
+                [
+                    "last_successful_refresh",
+                    "last_refresh_attempt",
+                    "refresh_status",
+                    "refresh_duration_ms",
+                    "last_updated",
+                ]
+            )
+            update_values.extend([finished_at, started_at, refresh_status, duration_ms, finished_at])
+        else:
+            update_columns.extend(
+                [
+                    "last_successful_refresh",
+                    "last_refresh_attempt",
+                    "refresh_status",
+                    "refresh_duration_ms",
+                ]
+            )
+            update_values.extend([finished_at, started_at, refresh_status, duration_ms])
+
+        await self._execute_dynamic_update(connection, record.ticker, update_columns, update_values)
+        return CompanyRefreshOutcome(
+            inserted=False,
+            updated_fields=updated_fields,
+            skipped_fields=skipped_fields,
+            validation_warnings=validation_warnings,
+            field_update_reasons=field_update_reasons,
+        )
+
+    async def _record_company_failure_on_connection(
+        self,
+        connection: asyncpg.Connection,
+        company: CatalogCompany,
+        *,
+        error_message: str,
+        started_at: datetime,
+        finished_at: datetime,
+        duration_ms: int,
+    ) -> CompanyRefreshOutcome:
+        existing = await self._fetch_company_row(connection, company.ticker)
+        fallback_company_name = company.company_name or company.ticker
+
+        if existing is None:
+            await connection.execute(
+                """
+                INSERT INTO public.ies_company_metadata (
+                    ticker,
+                    company_name,
+                    sector,
+                    industry,
+                    country,
+                    region,
+                    exchange,
+                    currency,
+                    revenue_ttm,
+                    market_cap,
+                    last_successful_refresh,
+                    last_refresh_attempt,
+                    refresh_status,
+                    last_error_message,
+                    refresh_duration_ms,
+                    last_updated
+                ) VALUES (
+                    $1, $2, '', '', '', '', '', '', NULL, NULL, NULL, $3, 'failed', $4, $5, $6
+                )
+                """,
+                company.ticker,
+                fallback_company_name,
+                started_at,
+                error_message,
+                duration_ms,
+                finished_at,
+            )
+            return CompanyRefreshOutcome(
+                inserted=True,
+                updated_fields=[],
+                skipped_fields=[],
+                validation_warnings=[],
+                field_update_reasons=[f"{company.ticker}:failed:{error_message}"],
+            )
+
+        await connection.execute(
+            """
+            UPDATE public.ies_company_metadata
+            SET last_refresh_attempt = $2,
+                refresh_status = 'failed',
+                last_error_message = $3,
+                refresh_duration_ms = $4,
+                last_updated = $5
+            WHERE ticker = $1
+            """,
+            company.ticker,
+            started_at,
+            error_message,
+            duration_ms,
+            finished_at,
+        )
+        return CompanyRefreshOutcome(
+            inserted=False,
+            updated_fields=[],
+            skipped_fields=[],
+            validation_warnings=[],
+            field_update_reasons=[f"{company.ticker}:failed:{error_message}"],
+        )
+
+    async def _execute_dynamic_update(
+        self,
+        connection: asyncpg.Connection,
+        ticker: str,
+        columns: list[str],
+        values: list[Any],
+    ) -> None:
+        assignments = ", ".join(f"{column} = ${index}" for index, column in enumerate(columns, start=2))
+        sql = f"UPDATE public.ies_company_metadata SET {assignments} WHERE ticker = $1"
+        await connection.execute(sql, ticker, *values)
+
+    def _merge_company_values(
+        self,
+        existing: CompanyMetadataRow | None,
+        record: FetchResult,
+    ) -> tuple[dict[str, Any], list[str], list[str], list[str], list[str]]:
+        merged: dict[str, Any] = {}
+        updated_fields: list[str] = []
+        skipped_fields: list[str] = []
+        validation_warnings: list[str] = []
+        field_update_reasons: list[str] = []
+
+        def current_value(column: str) -> Any:
+            if existing is None:
+                return None
+            return getattr(existing, column)
+
+        def merge_text(column: str, fetched_value: Any, *, fallback_value: Any | None = None) -> None:
+            existing_value = current_value(column)
+            normalized_fetched = _clean_text(fetched_value)
+            if normalized_fetched is None:
+                if existing_value is None and fallback_value is not None:
+                    normalized_fetched = _clean_text(fallback_value)
+                else:
+                    merged[column] = existing_value if existing_value is not None else ""
+                    skipped_fields.append(column)
+                    return
+            if existing_value is None:
+                merged[column] = normalized_fetched
+                updated_fields.append(column)
+                field_update_reasons.append(f"{record.ticker}.{column}:field_empty")
+                return
+            if str(existing_value).strip() != normalized_fetched:
+                merged[column] = normalized_fetched
+                updated_fields.append(column)
+                field_update_reasons.append(f"{record.ticker}.{column}:data_changed")
+                return
+            merged[column] = existing_value if existing_value is not None else ""
+            skipped_fields.append(column)
+
+        def normalize_numeric(value: Any) -> Decimal | None:
+            if value is None or isinstance(value, bool):
+                return None
+            if isinstance(value, Decimal):
+                return value
+            if isinstance(value, int):
+                return Decimal(value)
+            if isinstance(value, float):
+                return Decimal(str(value))
+            try:
+                return Decimal(str(value))
+            except Exception:
+                return None
+
+        def merge_numeric(column: str, fetched_value: Any) -> None:
+            existing_value = current_value(column)
+            normalized_fetched = normalize_numeric(fetched_value)
+            if normalized_fetched is None:
+                merged[column] = existing_value
+                skipped_fields.append(column)
+                return
+            if normalized_fetched < 0:
+                validation_warnings.append(f"{record.ticker}.{column}:negative_value_skipped")
+                merged[column] = existing_value
+                skipped_fields.append(column)
+                return
+            if column == "market_cap" and normalized_fetched <= 0:
+                validation_warnings.append(f"{record.ticker}.{column}:non_positive_value_skipped")
+                merged[column] = existing_value
+                skipped_fields.append(column)
+                return
+            if existing_value is None:
+                merged[column] = normalized_fetched
+                updated_fields.append(column)
+                field_update_reasons.append(f"{record.ticker}.{column}:field_empty")
+                return
+            normalized_existing = normalize_numeric(existing_value)
+            if normalized_existing is None:
+                merged[column] = normalized_fetched
+                updated_fields.append(column)
+                field_update_reasons.append(f"{record.ticker}.{column}:field_empty")
+                return
+            if normalized_existing != normalized_fetched:
+                merged[column] = normalized_fetched
+                updated_fields.append(column)
+                if normalized_fetched > normalized_existing:
+                    field_update_reasons.append(f"{record.ticker}.{column}:newer_information")
+                else:
+                    field_update_reasons.append(f"{record.ticker}.{column}:data_changed")
+                return
+            merged[column] = normalized_existing
+            skipped_fields.append(column)
+
+        merge_text("company_name", record.company_name, fallback_value=record.catalog_company_name or record.ticker)
+        merge_text("sector", record.sector)
+        merge_text("industry", record.industry)
+        merge_text("country", record.country)
+        merge_text("region", record.region)
+        merge_text("exchange", record.exchange)
+        merge_text("currency", record.currency)
+        merge_numeric("revenue_ttm", record.revenue_ttm)
+        merge_numeric("market_cap", record.market_cap)
+
+        if existing is not None and not updated_fields:
+            merged["company_name"] = existing.company_name
+
+        return merged, updated_fields, skipped_fields, validation_warnings, field_update_reasons

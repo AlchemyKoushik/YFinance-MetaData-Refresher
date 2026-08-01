@@ -12,10 +12,16 @@ class HealthResponse(BaseModel):
 
 class RefreshResponse(BaseModel):
     status: Literal["success", "failed"]
+    run_id: str | None = None
+    started_at_ist: str | None = None
+    finished_at_ist: str | None = None
     processed: int
     inserted: int
     updated: int
+    skipped: int
     failed: int
+    total_api_calls: int
+    validation_warnings: int
     duration_seconds: float
     message: str
 

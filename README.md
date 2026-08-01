@@ -6,8 +6,9 @@ Independent FastAPI service that reads the bundled IES catalog, fetches lightwei
 
 - Loads the bundled `data/ies_catalog.json` file locally.
 - Pulls only the lightweight fields needed for the metadata table.
-- Upserts into `public.ies_company_metadata` by `ticker`.
-- Records each refresh run in `public.ies_refresh_log`.
+- Updates fields selectively so existing valid data is never replaced by null or empty Yahoo values.
+- Uses a refresh lock so only one run can execute at a time.
+- Records each refresh run in `public.ies_refresh_log` with counts, warnings, and field-change reasons.
 - Exposes `GET /health` and `POST /refresh`.
 
 ## Project Layout
@@ -93,9 +94,13 @@ Recommended n8n handling:
 5. Log the response summary or route it to your own notification step.
 6. Use a response timeout that is comfortably longer than the service's own refresh timeout and the n8n execution window.
 
+The `/refresh` response includes IST-formatted timestamps for `started_at_ist` and `finished_at_ist`.
+
 ## Notes
 
-- The refresh is concurrent and retry-aware, but it keeps processing if individual tickers fail.
+- The refresh is concurrent, retry-aware, and continues if individual tickers fail.
+- If another refresh is already in progress, the service returns HTTP 409 with `{"status":"already_running","message":"A metadata refresh is already in progress."}`.
+- User-facing timestamps are exposed in IST (`Asia/Kolkata`).
 - The service does not scrape Yahoo and does not use the OSINT backend.
 - The bundled catalog is read locally from disk.
 

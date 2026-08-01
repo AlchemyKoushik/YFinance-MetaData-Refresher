@@ -11,7 +11,8 @@ from app.config import get_settings
 from app.database import DatabaseService
 from app.logging_setup import configure_logging
 from app.models import HealthResponse, RefreshResponse
-from app.refresh import RefreshExecutionError, RefreshService
+from app.refresh import RefreshAlreadyRunningError, RefreshExecutionError, RefreshService
+from app.time_utils import format_ist
 
 
 @asynccontextmanager
@@ -59,13 +60,33 @@ async def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-def _failure_payload(processed: int, inserted: int, updated: int, failed: int, duration_seconds: float, message: str) -> RefreshResponse:
+def _failure_payload(
+    processed: int,
+    inserted: int,
+    updated: int,
+    skipped: int,
+    failed: int,
+    duration_seconds: float,
+    message: str,
+    *,
+    run_id: str | None = None,
+    started_at_ist: str | None = None,
+    finished_at_ist: str | None = None,
+    total_api_calls: int = 0,
+    validation_warnings: int = 0,
+) -> RefreshResponse:
     return RefreshResponse(
         status="failed",
+        run_id=run_id,
+        started_at_ist=started_at_ist,
+        finished_at_ist=finished_at_ist,
         processed=processed,
         inserted=inserted,
         updated=updated,
+        skipped=skipped,
         failed=failed,
+        total_api_calls=total_api_calls,
+        validation_warnings=validation_warnings,
         duration_seconds=round(duration_seconds, 3),
         message=message,
     )
@@ -78,39 +99,59 @@ async def refresh(request: Request) -> RefreshResponse | JSONResponse:
         try:
             request.app.state.validation_report = await service.validate_system()
         except Exception as exc:
-            payload = _failure_payload(0, 0, 0, 0, 0.0, f"Service validation failed: {exc}")
+            payload = _failure_payload(0, 0, 0, 0, 0, 0.0, f"Service validation failed: {exc}")
             return JSONResponse(status_code=503, content=payload.model_dump())
 
     if not request.app.state.validation_report.passed:
         try:
             request.app.state.validation_report = await service.validate_system()
         except Exception as exc:
-            payload = _failure_payload(0, 0, 0, 0, 0.0, f"Service validation failed: {exc}")
+            payload = _failure_payload(0, 0, 0, 0, 0, 0.0, f"Service validation failed: {exc}")
             return JSONResponse(status_code=503, content=payload.model_dump())
 
     try:
         summary = await service.run_refresh()
+    except RefreshAlreadyRunningError:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "already_running",
+                "message": "A metadata refresh is already in progress.",
+            },
+        )
     except RefreshExecutionError as exc:
         summary = exc.summary
         payload = _failure_payload(
             summary.processed,
             summary.inserted,
             summary.updated,
+            summary.skipped,
             max(summary.failed, 1),
             summary.duration_seconds,
             f"Metadata refresh failed: {exc}",
+            run_id=str(summary.run_id),
+            started_at_ist=format_ist(summary.started_at),
+            finished_at_ist=format_ist(summary.finished_at),
+            total_api_calls=summary.total_api_calls,
+            validation_warnings=summary.validation_warnings,
         )
         return JSONResponse(status_code=500, content=payload.model_dump())
     except Exception as exc:
-        payload = _failure_payload(0, 0, 0, 0, 0.0, f"Metadata refresh failed: {exc}")
+        payload = _failure_payload(0, 0, 0, 0, 0, 0.0, f"Metadata refresh failed: {exc}")
         return JSONResponse(status_code=500, content=payload.model_dump())
 
     return RefreshResponse(
         status="success",
+        run_id=str(summary.run_id),
+        started_at_ist=format_ist(summary.started_at),
+        finished_at_ist=format_ist(summary.finished_at),
         processed=summary.processed,
         inserted=summary.inserted,
         updated=summary.updated,
+        skipped=summary.skipped,
         failed=summary.failed,
+        total_api_calls=summary.total_api_calls,
+        validation_warnings=summary.validation_warnings,
         duration_seconds=round(summary.duration_seconds, 3),
         message="Metadata refresh completed successfully",
     )
