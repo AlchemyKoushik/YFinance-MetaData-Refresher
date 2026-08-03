@@ -38,8 +38,9 @@ The service is suitable for:
 7. Companies are fetched concurrently with bounded concurrency and retry logic.
 8. Each company update is applied in its own database transaction.
 9. Per-company failures are recorded, but the refresh continues.
-10. The refresh log is updated at the end with the final counts, warnings, and timing.
-11. Locks are released and the API returns a final JSON response.
+10. After a successful refresh pass, region normalization runs against the persisted metadata and updates only rows whose `region` no longer matches the mapped `country`.
+11. The refresh log is updated at the end with the final counts, warnings, and timing.
+12. Locks are released and the API returns a final JSON response.
 
 ### Component Diagram
 
@@ -372,10 +373,11 @@ Example:
    - a fetch is attempted with retry logic,
    - the database row is updated in a transaction,
    - per-company failure metadata is recorded if fetch or write fails.
-9. The refresh log is updated with final counts and status.
-10. The advisory lock is released.
-11. The in-process guard is released.
-12. The API returns the final summary.
+9. If the refresh completes successfully, the service performs a separate region normalization pass that updates only rows with an incorrect `region`.
+10. The refresh log is updated with final counts and status.
+11. The advisory lock is released.
+12. The in-process guard is released.
+13. The API returns the final summary.
 
 ### Important implementation detail
 

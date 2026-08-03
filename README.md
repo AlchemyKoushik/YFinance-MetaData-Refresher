@@ -9,6 +9,7 @@ Independent FastAPI service that reads the bundled IES catalog, fetches lightwei
 - Updates fields selectively so existing valid data is never replaced by null or empty Yahoo values.
 - Uses a refresh lock so only one run can execute at a time.
 - Records each refresh run in `public.ies_refresh_log` with counts, warnings, and field-change reasons.
+- Automatically normalizes company `region` values from `country` after a successful refresh.
 - Exposes `GET /health` and `POST /refresh`.
 
 ## Project Layout
@@ -99,6 +100,7 @@ The `/refresh` response includes IST-formatted timestamps for `started_at_ist` a
 ## Notes
 
 - The refresh is concurrent, retry-aware, and continues if individual tickers fail.
+- After a successful refresh, the service automatically normalizes `region` from `country` and only updates rows whose region is wrong.
 - If another refresh is already in progress, the service returns HTTP 409 with `{"status":"already_running","message":"A metadata refresh is already in progress."}`.
 - User-facing timestamps are exposed in IST (`Asia/Kolkata`).
 - The service does not scrape Yahoo and does not use the OSINT backend.

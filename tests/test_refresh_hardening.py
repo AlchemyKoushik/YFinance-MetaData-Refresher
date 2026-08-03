@@ -12,6 +12,7 @@ from app.catalog import CatalogCompany
 from app.config import Settings
 from app.database import CompanyMetadataRow, DatabaseService
 from app.refresh import RefreshAlreadyRunningError, RefreshService
+from app.services.region_normalizer import expected_region_for_country, plan_region_normalization, RegionNormalizationInput
 from app.yfinance_client import FetchFailure, FetchResult, fetch_company_metadata
 
 
@@ -80,6 +81,8 @@ class FakeDatabase:
         self.updated_logs: list[object] = []
         self.failure_updates: list[tuple[str, str]] = []
         self.applied_updates: list[str] = []
+        self.region_normalization_calls = 0
+        self.region_normalization_summary = None
 
     async def open(self) -> None:
         return None
@@ -217,6 +220,37 @@ class FakeDatabase:
             "field_update_reasons": [f"{company.ticker}:failed:{error_message}"],
         })()
 
+    async def normalize_regions(self):
+        self.region_normalization_calls += 1
+        rows = [
+            RegionNormalizationInput(ticker=row.ticker, country=row.country, current_region=row.region)
+            for row in self.rows.values()
+            if row.country
+        ]
+        plan = plan_region_normalization(rows)
+        self.region_normalization_summary = plan.summary
+        for update in plan.updates:
+            row = self.rows[update.ticker]
+            self.rows[update.ticker] = CompanyMetadataRow(
+                ticker=row.ticker,
+                company_name=row.company_name,
+                sector=row.sector,
+                industry=row.industry,
+                country=row.country,
+                region=update.expected_region,
+                exchange=row.exchange,
+                currency=row.currency,
+                revenue_ttm=row.revenue_ttm,
+                market_cap=row.market_cap,
+                last_successful_refresh=row.last_successful_refresh,
+                last_refresh_attempt=row.last_refresh_attempt,
+                refresh_status=row.refresh_status,
+                last_error_message=row.last_error_message,
+                refresh_duration_ms=row.refresh_duration_ms,
+                last_updated=row.last_updated,
+            )
+        return plan.summary
+
 
 class RefreshHardeningTests(unittest.IsolatedAsyncioTestCase):
     def test_merge_preserves_existing_values_on_partial_fetch(self) -> None:
@@ -276,6 +310,32 @@ class RefreshHardeningTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(merged["market_cap"], Decimal("11000000000"))
         self.assertIn("ABC.market_cap:non_positive_value_skipped", validation_warnings)
+
+    def test_region_mapping_covers_common_country_names(self) -> None:
+        self.assertEqual(expected_region_for_country("United States"), "North America")
+        self.assertEqual(expected_region_for_country("USA"), "North America")
+        self.assertEqual(expected_region_for_country("India"), "Asia")
+        self.assertEqual(expected_region_for_country("UAE"), "Asia")
+        self.assertEqual(expected_region_for_country("United Kingdom"), "Europe")
+        self.assertEqual(expected_region_for_country("Brazil"), "South America")
+        self.assertEqual(expected_region_for_country("Australia"), "Oceania")
+        self.assertEqual(expected_region_for_country("South Africa"), "Africa")
+
+    def test_region_plan_skips_unknown_and_already_correct_rows(self) -> None:
+        plan = plan_region_normalization(
+            [
+                RegionNormalizationInput(ticker="AAA", country="India", current_region="US"),
+                RegionNormalizationInput(ticker="BBB", country="Germany", current_region="Europe"),
+                RegionNormalizationInput(ticker="CCC", country="Congo DR", current_region="US"),
+            ]
+        )
+
+        self.assertEqual(plan.summary.scanned, 3)
+        self.assertEqual(plan.summary.rows_requiring_update, 1)
+        self.assertEqual(plan.summary.updated, 1)
+        self.assertEqual(plan.summary.skipped, 1)
+        self.assertEqual(plan.summary.unknown_countries, ["Congo DR"])
+        self.assertEqual(plan.updates[0].expected_region, "Asia")
 
     async def test_fetch_retries_transient_errors_and_counts_attempts(self) -> None:
         calls: list[int] = []
@@ -431,6 +491,47 @@ class RefreshHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_db.rows["ABC"].revenue_ttm, Decimal("5200000000"))
         self.assertEqual(fake_db.rows["XYZ"].market_cap, Decimal("1000"))
         self.assertEqual(fake_db.rows["XYZ"].revenue_ttm, Decimal("900"))
+        self.assertEqual(fake_db.region_normalization_calls, 2)
+        self.assertEqual(fake_db.rows["ABC"].region, "North America")
+
+    async def test_service_invokes_region_normalization_after_successful_refresh(self) -> None:
+        async def fake_fetch(company, **kwargs):
+            now = _utc_now()
+            return FetchResult(
+                ticker=company.ticker,
+                attempts=1,
+                catalog_company_name=company.company_name,
+                started_at=now,
+                finished_at=now,
+                duration_ms=0,
+                company_name=company.company_name or company.ticker,
+                sector="Technology",
+                industry="Software",
+                country="India",
+                region="US",
+                exchange="NSE",
+                currency="INR",
+                revenue_ttm=Decimal("1"),
+                market_cap=Decimal("2"),
+                last_updated=now,
+            )
+
+        fake_db = FakeDatabase()
+        service = RefreshService(
+            Settings(
+                database_url="postgres://example",
+                catalog_path=Path("data/ies_catalog.json"),
+            ),
+            DummyCatalog([CatalogCompany(ticker="ABC", company_name="Alpha Corp")]),
+            fake_db,  # type: ignore[arg-type]
+        )
+
+        with patch("app.refresh.fetch_company_metadata", side_effect=fake_fetch):
+            summary = await service.run_refresh()
+
+        self.assertEqual(summary.failed, 0)
+        self.assertEqual(fake_db.region_normalization_calls, 1)
+        self.assertEqual(fake_db.rows["ABC"].region, "Asia")
 
     async def test_database_apply_company_refresh_rolls_back_on_failure(self) -> None:
         class FakeTransaction:

@@ -12,6 +12,7 @@ import asyncpg
 
 from app.catalog import CatalogCompany
 from app.time_utils import utc_now
+from app.services.region_normalizer import RegionNormalizationInput, RegionNormalizationSummary, plan_region_normalization
 from app.yfinance_client import FetchResult
 
 
@@ -693,6 +694,37 @@ class DatabaseService:
             field_update_reasons=[f"{company.ticker}:failed:{error_message}"],
         )
 
+    async def normalize_regions(self) -> RegionNormalizationSummary:
+        pool = self._require_pool()
+        async with pool.acquire() as connection:
+            transaction = connection.transaction()
+            await transaction.start()
+            try:
+                rows = await connection.fetch(
+                    """
+                    SELECT ticker, country, region
+                    FROM public.ies_company_metadata
+                    WHERE country IS NOT NULL
+                      AND btrim(country) <> ''
+                    ORDER BY ticker
+                    """
+                )
+                plan = plan_region_normalization(
+                    RegionNormalizationInput(
+                        ticker=row["ticker"],
+                        country=row["country"],
+                        current_region=row["region"],
+                    )
+                    for row in rows
+                )
+                if plan.updates:
+                    await self._bulk_update_regions(connection, plan.updates)
+                await transaction.commit()
+                return plan.summary
+            except Exception:
+                await transaction.rollback()
+                raise
+
     async def _execute_dynamic_update(
         self,
         connection: asyncpg.Connection,
@@ -703,6 +735,34 @@ class DatabaseService:
         assignments = ", ".join(f"{column} = ${index}" for index, column in enumerate(columns, start=2))
         sql = f"UPDATE public.ies_company_metadata SET {assignments} WHERE ticker = $1"
         await connection.execute(sql, ticker, *values)
+
+    async def _bulk_update_regions(
+        self,
+        connection: asyncpg.Connection,
+        updates: list["RegionNormalizationUpdate"],
+        *,
+        chunk_size: int = 1000,
+    ) -> None:
+        for index in range(0, len(updates), chunk_size):
+            chunk = updates[index : index + chunk_size]
+            values: list[Any] = []
+            placeholders: list[str] = []
+            for chunk_index, update in enumerate(chunk, start=1):
+                placeholder_offset = (chunk_index - 1) * 3
+                placeholders.append(
+                    f"(${placeholder_offset + 1}, ${placeholder_offset + 2}, ${placeholder_offset + 3})"
+                )
+                values.extend([update.ticker, update.expected_region, utc_now()])
+
+            sql = f"""
+            UPDATE public.ies_company_metadata AS company
+            SET region = data.region,
+                last_updated = data.last_updated
+            FROM (VALUES {', '.join(placeholders)}) AS data(ticker, region, last_updated)
+            WHERE company.ticker = data.ticker
+              AND company.region IS DISTINCT FROM data.region
+            """
+            await connection.execute(sql, *values)
 
     def _merge_company_values(
         self,

@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from app.catalog import CatalogCompany, CatalogRepository
 from app.config import Settings
 from app.database import CompanyRefreshOutcome, DatabaseService, RefreshLogEntry
+from app.services.region_normalizer import RegionNormalizationSummary
 from app.time_utils import format_ist, utc_now
 from app.yfinance_client import FetchFailure, FetchResult, fetch_company_metadata
 
@@ -214,6 +215,12 @@ class RefreshService:
             if log_written:
                 await self.database.update_refresh_log(log_entry)
 
+            try:
+                region_summary = await self.database.normalize_regions()
+                self._log_region_normalization_summary(region_summary)
+            except Exception:
+                logger.exception("Region normalization failed run_id=%s", run_id)
+
             logger.info(
                 "Metadata refresh finished run_id=%s duration_seconds=%.3f processed=%s inserted=%s updated=%s skipped=%s failed=%s",
                 run_id,
@@ -281,6 +288,41 @@ class RefreshService:
                 await lock.release()
             if self._refresh_guard.locked():
                 self._refresh_guard.release()
+
+    def _log_region_normalization_summary(self, summary: RegionNormalizationSummary) -> None:
+        logger.info("--------------------------------------------------------")
+        logger.info("Region Normalization Started")
+        logger.info("--------------------------------------------------------")
+        logger.info(
+            "Region normalization summary scanned=%s recognized_countries=%s rows_requiring_update=%s",
+            summary.scanned,
+            summary.recognized_countries,
+            summary.rows_requiring_update,
+        )
+        if summary.updated_country_counts:
+            for country in sorted(summary.updated_country_counts):
+                region = self._region_for_country(country)
+                logger.info("Updated %s -> %s rows=%s", country, region, summary.updated_country_counts[country])
+        if summary.unknown_countries:
+            for country in summary.unknown_countries:
+                logger.warning('Unknown Country: "%s"', country)
+        logger.info("--------------------------------------------------------")
+        logger.info("Region Normalization Complete")
+        logger.info("--------------------------------------------------------")
+        skipped_correct = summary.skipped
+        logger.info(
+            "Total scanned: %s updated: %s skipped_already_correct: %s unknown_countries: %s",
+            summary.scanned,
+            summary.updated,
+            skipped_correct,
+            len(summary.unknown_countries),
+        )
+
+    @staticmethod
+    def _region_for_country(country: str) -> str | None:
+        from app.services.region_normalizer import expected_region_for_country
+
+        return expected_region_for_country(country)
 
     def _chunk_companies(self, companies: list[CatalogCompany], chunk_size: int):
         for index in range(0, len(companies), chunk_size):
