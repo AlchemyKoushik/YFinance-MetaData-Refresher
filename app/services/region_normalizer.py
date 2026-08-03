@@ -20,6 +20,10 @@ def _normalize_key(value: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip()
 
 
+def _display_country(label: str) -> str:
+    return label.strip()
+
+
 def _region_aliases(region: str, countries: Iterable[tuple[str, tuple[str, ...]]]) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for country, aliases in countries:
@@ -41,7 +45,7 @@ _COUNTRY_GROUPS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("Central African Republic", ()),
         ("Chad", ()),
         ("Comoros", ()),
-        ("Cote d'Ivoire", ("Côte d'Ivoire", "Ivory Coast")),
+        ("Cote d'Ivoire", ("Cote d Ivoire", "Cote D'Ivoire", "Cote D Ivoire", "Côte d'Ivoire", "Ivory Coast")),
         ("Djibouti", ()),
         ("Egypt", ()),
         ("Equatorial Guinea", ()),
@@ -68,7 +72,7 @@ _COUNTRY_GROUPS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("Niger", ()),
         ("Nigeria", ()),
         ("Rwanda", ()),
-        ("Sao Tome and Principe", ("São Tomé and Príncipe",)),
+        ("Sao Tome and Principe", ("Sao Tome e Principe", "Sao Tome and Principe", "São Tomé and Príncipe")),
         ("Senegal", ()),
         ("Seychelles", ()),
         ("Sierra Leone", ()),
@@ -219,7 +223,7 @@ _COUNTRY_GROUPS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("Nicaragua", ()),
         ("Panama", ()),
         ("Puerto Rico", ()),
-        ("Saint Barthélemy", ("Saint Barthelemy",)),
+        ("Saint Barthelemy", ("Saint Barthélemy",)),
         ("Saint Kitts and Nevis", ()),
         ("Saint Lucia", ()),
         ("Saint Martin", ()),
@@ -284,8 +288,17 @@ _COUNTRY_GROUPS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
 
 
 COUNTRY_TO_REGION: dict[str, str] = {}
+COUNTRY_CANONICAL_BY_KEY: dict[str, str] = {}
+COUNTRY_LABELS_BY_CANONICAL: dict[str, set[str]] = {}
 for region, countries in _COUNTRY_GROUPS.items():
     COUNTRY_TO_REGION.update(_region_aliases(region, countries))
+    for country, aliases in countries:
+        canonical_key = _normalize_key(country)
+        COUNTRY_CANONICAL_BY_KEY[canonical_key] = country
+        COUNTRY_LABELS_BY_CANONICAL.setdefault(country, set()).add(country)
+        for alias in aliases:
+            COUNTRY_CANONICAL_BY_KEY[_normalize_key(alias)] = country
+            COUNTRY_LABELS_BY_CANONICAL[country].add(alias)
 
 
 @dataclass(slots=True)
@@ -323,6 +336,19 @@ def expected_region_for_country(country: str | None) -> str | None:
     if country is None:
         return None
     return COUNTRY_TO_REGION.get(_normalize_key(country))
+
+
+def country_filter_terms(country: str) -> list[str]:
+    normalized = _normalize_key(country)
+    if not normalized:
+        return []
+    canonical = COUNTRY_CANONICAL_BY_KEY.get(normalized)
+    if canonical is None:
+        return [_display_country(country)]
+    terms = {label for label in COUNTRY_LABELS_BY_CANONICAL.get(canonical, {canonical}) if _normalize_key(label)}
+    if terms:
+        return sorted(terms)
+    return [_display_country(country)]
 
 
 def plan_region_normalization(rows: Iterable[RegionNormalizationInput]) -> RegionNormalizationPlan:

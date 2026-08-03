@@ -12,7 +12,13 @@ from app.catalog import CatalogCompany
 from app.config import Settings
 from app.database import CompanyMetadataRow, DatabaseService
 from app.refresh import RefreshAlreadyRunningError, RefreshService
-from app.services.region_normalizer import expected_region_for_country, plan_region_normalization, RegionNormalizationInput
+from app.services.region_normalizer import (
+    country_filter_terms,
+    expected_region_for_country,
+    plan_region_normalization,
+    RegionNormalizationInput,
+    RegionNormalizationUpdate,
+)
 from app.yfinance_client import FetchFailure, FetchResult, fetch_company_metadata
 
 
@@ -220,35 +226,46 @@ class FakeDatabase:
             "field_update_reasons": [f"{company.ticker}:failed:{error_message}"],
         })()
 
-    async def normalize_regions(self):
+    async def normalize_regions(self, *, countries=None, dry_run=False):
         self.region_normalization_calls += 1
-        rows = [
-            RegionNormalizationInput(ticker=row.ticker, country=row.country, current_region=row.region)
-            for row in self.rows.values()
-            if row.country
-        ]
+        if countries:
+            filter_terms = set()
+            for country in countries:
+                filter_terms.update(term.strip() for term in country_filter_terms(country))
+            rows = [
+                RegionNormalizationInput(ticker=row.ticker, country=row.country, current_region=row.region)
+                for row in self.rows.values()
+                if row.country and row.country.strip() in filter_terms
+            ]
+        else:
+            rows = [
+                RegionNormalizationInput(ticker=row.ticker, country=row.country, current_region=row.region)
+                for row in self.rows.values()
+                if row.country
+            ]
         plan = plan_region_normalization(rows)
         self.region_normalization_summary = plan.summary
-        for update in plan.updates:
-            row = self.rows[update.ticker]
-            self.rows[update.ticker] = CompanyMetadataRow(
-                ticker=row.ticker,
-                company_name=row.company_name,
-                sector=row.sector,
-                industry=row.industry,
-                country=row.country,
-                region=update.expected_region,
-                exchange=row.exchange,
-                currency=row.currency,
-                revenue_ttm=row.revenue_ttm,
-                market_cap=row.market_cap,
-                last_successful_refresh=row.last_successful_refresh,
-                last_refresh_attempt=row.last_refresh_attempt,
-                refresh_status=row.refresh_status,
-                last_error_message=row.last_error_message,
-                refresh_duration_ms=row.refresh_duration_ms,
-                last_updated=row.last_updated,
-            )
+        if not dry_run:
+            for update in plan.updates:
+                row = self.rows[update.ticker]
+                self.rows[update.ticker] = CompanyMetadataRow(
+                    ticker=row.ticker,
+                    company_name=row.company_name,
+                    sector=row.sector,
+                    industry=row.industry,
+                    country=row.country,
+                    region=update.expected_region,
+                    exchange=row.exchange,
+                    currency=row.currency,
+                    revenue_ttm=row.revenue_ttm,
+                    market_cap=row.market_cap,
+                    last_successful_refresh=row.last_successful_refresh,
+                    last_refresh_attempt=row.last_refresh_attempt,
+                    refresh_status=row.refresh_status,
+                    last_error_message=row.last_error_message,
+                    refresh_duration_ms=row.refresh_duration_ms,
+                    last_updated=row.last_updated,
+                )
         return plan.summary
 
 
@@ -336,6 +353,59 @@ class RefreshHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.summary.skipped, 1)
         self.assertEqual(plan.summary.unknown_countries, ["Congo DR"])
         self.assertEqual(plan.updates[0].expected_region, "Asia")
+
+    def test_country_filter_terms_resolve_aliases(self) -> None:
+        terms = country_filter_terms("USA")
+        self.assertIn("United States", terms)
+        self.assertIn("US", terms)
+
+    async def test_bulk_region_update_uses_typed_arrays(self) -> None:
+        class CaptureConnection:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+            async def execute(self, query, *args):
+                self.calls.append((query, args))
+
+        db = DatabaseService("postgres://example", min_size=1, max_size=1, command_timeout_seconds=1)
+        connection = CaptureConnection()
+
+        await db._bulk_update_regions(
+            connection,  # type: ignore[arg-type]
+            [RegionNormalizationUpdate(ticker="ABC", country="India", expected_region="Asia")],
+        )
+
+        self.assertEqual(len(connection.calls), 1)
+        query, args = connection.calls[0]
+        self.assertIn("unnest($1::text[], $2::text[], $3::timestamptz[])", query)
+        self.assertEqual(args[0], ["ABC"])
+        self.assertEqual(args[1], ["Asia"])
+        self.assertEqual(len(args[2]), 1)
+        self.assertIsInstance(args[2][0], datetime)
+
+    async def test_region_backfill_dry_run_does_not_mutate_rows(self) -> None:
+        fake_db = FakeDatabase({"ABC": _company_row(ticker="ABC", country="India", region="US")})
+
+        summary = await fake_db.normalize_regions(countries=["India"], dry_run=True)
+
+        self.assertEqual(summary.scanned, 1)
+        self.assertEqual(summary.rows_requiring_update, 1)
+        self.assertEqual(fake_db.rows["ABC"].region, "US")
+
+    async def test_region_backfill_country_filter_updates_only_matching_rows(self) -> None:
+        fake_db = FakeDatabase(
+            {
+                "IND": _company_row(ticker="IND", country="India", region="US"),
+                "DEU": _company_row(ticker="DEU", country="Germany", region="US"),
+            }
+        )
+
+        summary = await fake_db.normalize_regions(countries=["India"])
+
+        self.assertEqual(summary.scanned, 1)
+        self.assertEqual(summary.rows_requiring_update, 1)
+        self.assertEqual(fake_db.rows["IND"].region, "Asia")
+        self.assertEqual(fake_db.rows["DEU"].region, "US")
 
     async def test_fetch_retries_transient_errors_and_counts_attempts(self) -> None:
         calls: list[int] = []

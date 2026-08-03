@@ -12,7 +12,12 @@ import asyncpg
 
 from app.catalog import CatalogCompany
 from app.time_utils import utc_now
-from app.services.region_normalizer import RegionNormalizationInput, RegionNormalizationSummary, plan_region_normalization
+from app.services.region_normalizer import (
+    RegionNormalizationInput,
+    RegionNormalizationSummary,
+    country_filter_terms,
+    plan_region_normalization,
+)
 from app.yfinance_client import FetchResult
 
 
@@ -694,21 +699,51 @@ class DatabaseService:
             field_update_reasons=[f"{company.ticker}:failed:{error_message}"],
         )
 
-    async def normalize_regions(self) -> RegionNormalizationSummary:
+    async def normalize_regions(
+        self,
+        *,
+        countries: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> RegionNormalizationSummary:
         pool = self._require_pool()
         async with pool.acquire() as connection:
             transaction = connection.transaction()
             await transaction.start()
             try:
-                rows = await connection.fetch(
-                    """
-                    SELECT ticker, country, region
-                    FROM public.ies_company_metadata
-                    WHERE country IS NOT NULL
-                      AND btrim(country) <> ''
-                    ORDER BY ticker
-                    """
-                )
+                if countries:
+                    filter_terms: list[str] = []
+                    seen_terms: set[str] = set()
+                    for country in countries:
+                        for term in country_filter_terms(country):
+                            normalized_term = term.strip()
+                            if normalized_term and normalized_term not in seen_terms:
+                                seen_terms.add(normalized_term)
+                                filter_terms.append(normalized_term)
+                    if not filter_terms:
+                        plan = plan_region_normalization(())
+                        await transaction.commit()
+                        return plan.summary
+                    rows = await connection.fetch(
+                        """
+                        SELECT ticker, country, region
+                        FROM public.ies_company_metadata
+                        WHERE country IS NOT NULL
+                          AND btrim(country) <> ''
+                          AND btrim(country) = ANY($1::text[])
+                        ORDER BY ticker
+                        """,
+                        filter_terms,
+                    )
+                else:
+                    rows = await connection.fetch(
+                        """
+                        SELECT ticker, country, region
+                        FROM public.ies_company_metadata
+                        WHERE country IS NOT NULL
+                          AND btrim(country) <> ''
+                        ORDER BY ticker
+                        """
+                    )
                 plan = plan_region_normalization(
                     RegionNormalizationInput(
                         ticker=row["ticker"],
@@ -717,7 +752,7 @@ class DatabaseService:
                     )
                     for row in rows
                 )
-                if plan.updates:
+                if plan.updates and not dry_run:
                     await self._bulk_update_regions(connection, plan.updates)
                 await transaction.commit()
                 return plan.summary
@@ -745,24 +780,23 @@ class DatabaseService:
     ) -> None:
         for index in range(0, len(updates), chunk_size):
             chunk = updates[index : index + chunk_size]
-            values: list[Any] = []
-            placeholders: list[str] = []
-            for chunk_index, update in enumerate(chunk, start=1):
-                placeholder_offset = (chunk_index - 1) * 3
-                placeholders.append(
-                    f"(${placeholder_offset + 1}, ${placeholder_offset + 2}, ${placeholder_offset + 3})"
-                )
-                values.extend([update.ticker, update.expected_region, utc_now()])
-
-            sql = f"""
-            UPDATE public.ies_company_metadata AS company
-            SET region = data.region,
-                last_updated = data.last_updated
-            FROM (VALUES {', '.join(placeholders)}) AS data(ticker, region, last_updated)
-            WHERE company.ticker = data.ticker
-              AND company.region IS DISTINCT FROM data.region
-            """
-            await connection.execute(sql, *values)
+            updated_at = utc_now()
+            tickers = [update.ticker for update in chunk]
+            regions = [update.expected_region for update in chunk]
+            timestamps = [updated_at for _ in chunk]
+            await connection.execute(
+                """
+                UPDATE public.ies_company_metadata AS company
+                SET region = data.region,
+                    last_updated = data.last_updated
+                FROM unnest($1::text[], $2::text[], $3::timestamptz[]) AS data(ticker, region, last_updated)
+                WHERE company.ticker = data.ticker
+                  AND company.region IS DISTINCT FROM data.region
+                """,
+                tickers,
+                regions,
+                timestamps,
+            )
 
     def _merge_company_values(
         self,

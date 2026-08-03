@@ -97,6 +97,25 @@ Recommended n8n handling:
 
 The `/refresh` response includes IST-formatted timestamps for `started_at_ist` and `finished_at_ist`.
 
+## Region Backfill Utility
+
+Use this when you want to repair historical data or rerun region normalization without a full metadata refresh.
+
+Examples:
+
+```bash
+python scripts/backfill_regions.py
+python scripts/backfill_regions.py --dry-run
+python scripts/backfill_regions.py --country India
+python scripts/backfill_regions.py --country India --country Germany --dry-run
+```
+
+Notes:
+- The command uses the same country-to-region mapping as the refresh service.
+- By default it scans and updates the entire `ies_company_metadata` table.
+- `--dry-run` scans and reports changes without writing rows.
+- `--country` scopes the run to one or more countries.
+
 ## Notes
 
 - The refresh is concurrent, retry-aware, and continues if individual tickers fail.
