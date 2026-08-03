@@ -16,6 +16,7 @@ from app.services.region_normalizer import (
     RegionNormalizationInput,
     RegionNormalizationSummary,
     country_filter_terms,
+    expected_region_for_country,
     plan_region_normalization,
 )
 from app.yfinance_client import FetchResult
@@ -31,6 +32,9 @@ CREATE TABLE IF NOT EXISTS public.ies_company_metadata (
     company_name text NOT NULL,
     sector text NOT NULL DEFAULT '',
     industry text NOT NULL DEFAULT '',
+    listing_country text NOT NULL DEFAULT '',
+    listing_region text NOT NULL DEFAULT '',
+    listing_exchange text NOT NULL DEFAULT '',
     country text NOT NULL DEFAULT '',
     region text NOT NULL DEFAULT '',
     exchange text NOT NULL DEFAULT '',
@@ -72,7 +76,10 @@ ALTER TABLE public.ies_company_metadata
     ADD COLUMN IF NOT EXISTS last_refresh_attempt timestamptz,
     ADD COLUMN IF NOT EXISTS refresh_status text NOT NULL DEFAULT 'never',
     ADD COLUMN IF NOT EXISTS last_error_message text,
-    ADD COLUMN IF NOT EXISTS refresh_duration_ms integer
+    ADD COLUMN IF NOT EXISTS refresh_duration_ms integer,
+    ADD COLUMN IF NOT EXISTS listing_country text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS listing_region text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS listing_exchange text NOT NULL DEFAULT ''
 """
 
 
@@ -110,9 +117,12 @@ class CompanyMetadataRow:
     company_name: str
     sector: str
     industry: str
-    country: str
-    region: str
-    exchange: str
+    listing_country: str
+    listing_region: str
+    listing_exchange: str
+    company_country: str
+    company_region: str
+    company_exchange: str
     currency: str
     revenue_ttm: Decimal | int | float | None
     market_cap: Decimal | int | float | None
@@ -122,6 +132,18 @@ class CompanyMetadataRow:
     last_error_message: str | None
     refresh_duration_ms: int | None
     last_updated: datetime
+
+    @property
+    def country(self) -> str:
+        return self.company_country
+
+    @property
+    def region(self) -> str:
+        return self.company_region
+
+    @property
+    def exchange(self) -> str:
+        return self.company_exchange
 
 
 @dataclass(slots=True)
@@ -260,9 +282,12 @@ class DatabaseService:
                         company_name="Validation First",
                         sector=None,
                         industry=None,
-                        country=None,
-                        region=None,
-                        exchange=None,
+                        listing_country="United Kingdom",
+                        listing_region="Europe",
+                        listing_exchange="LSE",
+                        company_country=None,
+                        company_region=None,
+                        company_exchange=None,
                         currency=None,
                         revenue_ttm=Decimal("1"),
                         market_cap=Decimal("1"),
@@ -284,9 +309,12 @@ class DatabaseService:
                         company_name="Validation Second",
                         sector=None,
                         industry=None,
-                        country=None,
-                        region=None,
-                        exchange=None,
+                        listing_country="United Kingdom",
+                        listing_region="Europe",
+                        listing_exchange="LSE",
+                        company_country=None,
+                        company_region=None,
+                        company_exchange=None,
                         currency=None,
                         revenue_ttm=Decimal("2"),
                         market_cap=Decimal("2"),
@@ -447,6 +475,9 @@ class DatabaseService:
                 company_name,
                 sector,
                 industry,
+                listing_country,
+                listing_region,
+                listing_exchange,
                 country,
                 region,
                 exchange,
@@ -467,23 +498,40 @@ class DatabaseService:
         )
         if row is None:
             return None
+
+        def _value(key: str, default: Any = "") -> Any:
+            try:
+                value = row[key]
+            except Exception:
+                getter = getattr(row, "get", None)
+                if callable(getter):
+                    value = getter(key, default)
+                else:
+                    value = default
+            if value is None:
+                return default
+            return value
+
         return CompanyMetadataRow(
-            ticker=row["ticker"],
-            company_name=row["company_name"],
-            sector=row["sector"],
-            industry=row["industry"],
-            country=row["country"],
-            region=row["region"],
-            exchange=row["exchange"],
-            currency=row["currency"],
-            revenue_ttm=row["revenue_ttm"],
-            market_cap=row["market_cap"],
-            last_successful_refresh=row["last_successful_refresh"],
-            last_refresh_attempt=row["last_refresh_attempt"],
-            refresh_status=row["refresh_status"],
-            last_error_message=row["last_error_message"],
-            refresh_duration_ms=row["refresh_duration_ms"],
-            last_updated=row["last_updated"],
+            ticker=_value("ticker"),
+            company_name=_value("company_name"),
+            sector=_value("sector"),
+            industry=_value("industry"),
+            listing_country=_value("listing_country"),
+            listing_region=_value("listing_region"),
+            listing_exchange=_value("listing_exchange"),
+            company_country=_value("country"),
+            company_region=_value("region"),
+            company_exchange=_value("exchange"),
+            currency=_value("currency"),
+            revenue_ttm=_value("revenue_ttm", None),
+            market_cap=_value("market_cap", None),
+            last_successful_refresh=_value("last_successful_refresh", None),
+            last_refresh_attempt=_value("last_refresh_attempt", None),
+            refresh_status=_value("refresh_status"),
+            last_error_message=_value("last_error_message", None),
+            refresh_duration_ms=_value("refresh_duration_ms", None),
+            last_updated=_value("last_updated"),
         )
 
     async def _apply_company_refresh_on_connection(
@@ -510,6 +558,9 @@ class DatabaseService:
                     company_name,
                     sector,
                     industry,
+                    listing_country,
+                    listing_region,
+                    listing_exchange,
                     country,
                     region,
                     exchange,
@@ -523,16 +574,19 @@ class DatabaseService:
                     refresh_duration_ms,
                     last_updated
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
                 )
                 """,
                 record.ticker,
                 company_name,
                 merged["sector"],
                 merged["industry"],
-                merged["country"],
-                merged["region"],
-                merged["exchange"],
+                merged["listing_country"],
+                merged["listing_region"],
+                merged["listing_exchange"],
+                merged["company_country"],
+                merged["company_region"],
+                merged["company_exchange"],
                 merged["currency"],
                 merged["revenue_ttm"],
                 merged["market_cap"],
@@ -566,16 +620,28 @@ class DatabaseService:
                 if value != existing.industry:
                     update_columns.append("industry")
                     update_values.append(value)
-            elif column == "country":
-                if value != existing.country:
+            elif column == "listing_country":
+                if value != existing.listing_country:
+                    update_columns.append("listing_country")
+                    update_values.append(value)
+            elif column == "listing_region":
+                if value != existing.listing_region:
+                    update_columns.append("listing_region")
+                    update_values.append(value)
+            elif column == "listing_exchange":
+                if value != existing.listing_exchange:
+                    update_columns.append("listing_exchange")
+                    update_values.append(value)
+            elif column == "company_country":
+                if value != existing.company_country:
                     update_columns.append("country")
                     update_values.append(value)
-            elif column == "region":
-                if value != existing.region:
+            elif column == "company_region":
+                if value != existing.company_region:
                     update_columns.append("region")
                     update_values.append(value)
-            elif column == "exchange":
-                if value != existing.exchange:
+            elif column == "company_exchange":
+                if value != existing.company_exchange:
                     update_columns.append("exchange")
                     update_values.append(value)
             elif column == "currency":
@@ -644,6 +710,9 @@ class DatabaseService:
                     company_name,
                     sector,
                     industry,
+                    listing_country,
+                    listing_region,
+                    listing_exchange,
                     country,
                     region,
                     exchange,
@@ -657,11 +726,14 @@ class DatabaseService:
                     refresh_duration_ms,
                     last_updated
                 ) VALUES (
-                    $1, $2, '', '', '', '', '', '', NULL, NULL, NULL, $3, 'failed', $4, $5, $6
+                    $1, $2, '', '', $3, $4, $5, '', '', '', '', NULL, NULL, NULL, $6, 'failed', $7, $8, $9
                 )
                 """,
                 company.ticker,
                 fallback_company_name,
+                company.listing_country or "",
+                company.listing_region or "",
+                company.listing_exchange or "",
                 started_at,
                 error_message,
                 duration_ms,
@@ -725,7 +797,14 @@ class DatabaseService:
                         return plan.summary
                     rows = await connection.fetch(
                         """
-                        SELECT ticker, country, region
+                        SELECT
+                            ticker,
+                            listing_country,
+                            listing_region,
+                            listing_exchange,
+                            country AS company_country,
+                            region AS company_region,
+                            exchange AS company_exchange
                         FROM public.ies_company_metadata
                         WHERE country IS NOT NULL
                           AND btrim(country) <> ''
@@ -737,7 +816,14 @@ class DatabaseService:
                 else:
                     rows = await connection.fetch(
                         """
-                        SELECT ticker, country, region
+                        SELECT
+                            ticker,
+                            listing_country,
+                            listing_region,
+                            listing_exchange,
+                            country AS company_country,
+                            region AS company_region,
+                            exchange AS company_exchange
                         FROM public.ies_company_metadata
                         WHERE country IS NOT NULL
                           AND btrim(country) <> ''
@@ -747,8 +833,8 @@ class DatabaseService:
                 plan = plan_region_normalization(
                     RegionNormalizationInput(
                         ticker=row["ticker"],
-                        country=row["country"],
-                        current_region=row["region"],
+                        country=row["company_country"],
+                        current_region=row["company_region"],
                     )
                     for row in rows
                 )
@@ -893,9 +979,12 @@ class DatabaseService:
         merge_text("company_name", record.company_name, fallback_value=record.catalog_company_name or record.ticker)
         merge_text("sector", record.sector)
         merge_text("industry", record.industry)
-        merge_text("country", record.country)
-        merge_text("region", record.region)
-        merge_text("exchange", record.exchange)
+        merge_text("listing_country", record.listing_country)
+        merge_text("listing_region", record.listing_region, fallback_value=expected_region_for_country(record.listing_country))
+        merge_text("listing_exchange", record.listing_exchange)
+        merge_text("company_country", record.company_country)
+        merge_text("company_region", record.company_region)
+        merge_text("company_exchange", record.company_exchange)
         merge_text("currency", record.currency)
         merge_numeric("revenue_ttm", record.revenue_ttm)
         merge_numeric("market_cap", record.market_cap)

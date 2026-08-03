@@ -38,7 +38,7 @@ The service is suitable for:
 7. Companies are fetched concurrently with bounded concurrency and retry logic.
 8. Each company update is applied in its own database transaction.
 9. Per-company failures are recorded, but the refresh continues.
-10. After a successful refresh pass, region normalization runs against the persisted metadata and updates only rows whose `region` no longer matches the mapped `country`.
+10. After a successful refresh pass, region normalization runs against the persisted metadata and updates only rows whose company `region` no longer matches the mapped `company_country`.
 11. The refresh log is updated at the end with the final counts, warnings, and timing.
 12. Locks are released and the API returns a final JSON response.
 
@@ -154,6 +154,9 @@ Purpose: the current company metadata record for each ticker.
 | `company_name` | `text` | Required, never null |
 | `sector` | `text` | Required, defaults to empty string |
 | `industry` | `text` | Required, defaults to empty string |
+| `listing_country` | `text` | Discovery country from the bundled catalog |
+| `listing_region` | `text` | Discovery region derived from the catalog country |
+| `listing_exchange` | `text` | Discovery exchange from the bundled catalog |
 | `country` | `text` | Required, defaults to empty string |
 | `region` | `text` | Required, defaults to empty string |
 | `exchange` | `text` | Required, defaults to empty string |
@@ -171,6 +174,27 @@ Indexes used by the service:
 - `ies_company_metadata_last_updated_idx`
 - `ies_company_metadata_last_refresh_attempt_idx`
 - `ies_company_metadata_refresh_status_idx`
+
+### Geography model
+
+The service keeps two different geography dimensions because Yahoo and the discovery catalog describe different things:
+
+- `listing_country`, `listing_region`, `listing_exchange` describe where the security was discovered and listed in the bundled industry catalog.
+- `company_country`, `company_region` describe the issuer/company geography returned by `yfinance`.
+- The legacy `country` field is kept for backward compatibility and maps to `company_country`.
+
+Why they differ:
+
+- ADRs can be listed in the United States while the operating company is based in another country.
+- Foreign listings can trade on the London, Frankfurt, Toronto, or New York markets even when the issuer is incorporated elsewhere.
+- BDRs and other depositary receipts often carry a local listing venue that differs from the company headquarters.
+- Cross-listed securities may appear in several markets at once, each with a different listing exchange and sometimes a different discovery country.
+
+Rule of thumb:
+
+- Use `listing_country` when the endpoint or query is about market discovery, universe construction, or venue-based analytics.
+- Use `company_country` when the endpoint or query is about issuer geography, company domicile, or Yahoo enrichment.
+- Keep both values because enrichment data must never overwrite discovery metadata.
 
 ### `public.ies_refresh_log`
 

@@ -6,10 +6,11 @@ Independent FastAPI service that reads the bundled IES catalog, fetches lightwei
 
 - Loads the bundled `data/ies_catalog.json` file locally.
 - Pulls only the lightweight fields needed for the metadata table.
+- Preserves discovery metadata separately from Yahoo enrichment data so listing geography is never overwritten.
 - Updates fields selectively so existing valid data is never replaced by null or empty Yahoo values.
 - Uses a refresh lock so only one run can execute at a time.
 - Records each refresh run in `public.ies_refresh_log` with counts, warnings, and field-change reasons.
-- Automatically normalizes company `region` values from `country` after a successful refresh.
+- Automatically normalizes company `region` values from `company_country` after a successful refresh.
 - Exposes `GET /health` and `POST /refresh`.
 
 ## Project Layout
@@ -54,6 +55,11 @@ The current live Neon schema expects:
 
 - `public.ies_company_metadata` with a surrogate `id` primary key, unique `ticker`, and non-null discovery fields
 - `public.ies_refresh_log` for refresh run history and status tracking
+
+`public.ies_company_metadata` now stores both geography dimensions:
+
+- `listing_country`, `listing_region`, `listing_exchange` from the discovery catalog
+- `country`, `region`, `exchange` as the company/Yahoo layer for backward compatibility
 
 Recommended supporting indexes:
 
@@ -119,7 +125,8 @@ Notes:
 ## Notes
 
 - The refresh is concurrent, retry-aware, and continues if individual tickers fail.
-- After a successful refresh, the service automatically normalizes `region` from `country` and only updates rows whose region is wrong.
+- After a successful refresh, the service automatically normalizes company `region` from `company_country` and only updates rows whose region is wrong.
+- `listing_country` and the other listing fields are preserved exactly as discovered and are never overwritten by Yahoo enrichment.
 - If another refresh is already in progress, the service returns HTTP 409 with `{"status":"already_running","message":"A metadata refresh is already in progress."}`.
 - User-facing timestamps are exposed in IST (`Asia/Kolkata`).
 - The service does not scrape Yahoo and does not use the OSINT backend.

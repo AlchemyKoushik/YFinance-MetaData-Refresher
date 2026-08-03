@@ -26,13 +26,28 @@ class FetchResult:
     company_name: str | None
     sector: str | None
     industry: str | None
-    country: str | None
-    region: str | None
-    exchange: str | None
+    listing_country: str | None
+    listing_region: str | None
+    listing_exchange: str | None
+    company_country: str | None
+    company_region: str | None
+    company_exchange: str | None
     currency: str | None
     revenue_ttm: int | float | Decimal | None
     market_cap: int | float | Decimal | None
     last_updated: datetime
+
+    @property
+    def country(self) -> str | None:
+        return self.company_country
+
+    @property
+    def region(self) -> str | None:
+        return self.company_region
+
+    @property
+    def exchange(self) -> str | None:
+        return self.company_exchange
 
 
 @dataclass(slots=True)
@@ -40,6 +55,9 @@ class FetchFailure:
     ticker: str
     attempts: int
     catalog_company_name: str | None
+    listing_country: str | None
+    listing_region: str | None
+    listing_exchange: str | None
     started_at: datetime
     finished_at: datetime
     duration_ms: int
@@ -137,9 +155,12 @@ def _extract_metadata_sync(ticker: str) -> FetchResult:
         company_name=_first_text(info.get("longName"), info.get("shortName"), info.get("displayName"), info.get("symbol")),
         sector=_first_text(info.get("sector")),
         industry=_first_text(info.get("industry")),
-        country=_first_text(info.get("country")),
-        region=_first_text(info.get("region")),
-        exchange=_first_text(info.get("exchange"), info.get("fullExchangeName"), fast_info.get("exchange")),
+        listing_country=None,
+        listing_region=None,
+        listing_exchange=None,
+        company_country=_first_text(info.get("country")),
+        company_region=_first_text(info.get("region")),
+        company_exchange=_first_text(info.get("exchange"), info.get("fullExchangeName"), fast_info.get("exchange")),
         currency=_first_text(info.get("currency"), info.get("financialCurrency"), fast_info.get("currency")),
         revenue_ttm=_coerce_numeric(info.get("trailingAnnualRevenue") or info.get("totalRevenue")),
         market_cap=_coerce_numeric(info.get("marketCap") or fast_info.get("market_cap")),
@@ -162,6 +183,9 @@ async def fetch_company_metadata(
             result = await asyncio.wait_for(asyncio.to_thread(_extract_metadata_sync, company.ticker), timeout=timeout_seconds)
             result.attempts = attempt
             result.catalog_company_name = company.company_name
+            result.listing_country = company.listing_country
+            result.listing_region = company.listing_region
+            result.listing_exchange = company.listing_exchange
             result.started_at = overall_started_at
             result.finished_at = datetime.now(timezone.utc)
             result.duration_ms = int((result.finished_at - overall_started_at).total_seconds() * 1000)
@@ -182,6 +206,9 @@ async def fetch_company_metadata(
         ticker=company.ticker,
         attempts=attempt if last_error is not None else 0,
         catalog_company_name=company.company_name,
+        listing_country=company.listing_country,
+        listing_region=company.listing_region,
+        listing_exchange=company.listing_exchange,
         started_at=overall_started_at,
         finished_at=datetime.now(timezone.utc),
         duration_ms=int((datetime.now(timezone.utc) - overall_started_at).total_seconds() * 1000),

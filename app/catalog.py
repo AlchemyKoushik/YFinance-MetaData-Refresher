@@ -5,11 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from app.services.region_normalizer import expected_region_for_country
+
 
 @dataclass(slots=True)
 class CatalogCompany:
     ticker: str
     company_name: str | None = None
+    listing_country: str | None = None
+    listing_region: str | None = None
+    listing_exchange: str | None = None
 
 
 class CatalogRepository:
@@ -38,6 +43,7 @@ class CatalogRepository:
                     normalized = ticker.strip().upper()
                     if normalized and normalized not in seen:
                         seen.add(normalized)
+                        listing_country = _first_text(node.get("country"))
                         yield CatalogCompany(
                             ticker=normalized,
                             company_name=_first_text(
@@ -48,6 +54,9 @@ class CatalogRepository:
                                 node.get("longName"),
                                 node.get("displayName"),
                             ),
+                            listing_country=listing_country,
+                            listing_region=expected_region_for_country(listing_country),
+                            listing_exchange=_first_text(node.get("exchange")),
                         )
                 for value in node.values():
                     yield from walk(value)

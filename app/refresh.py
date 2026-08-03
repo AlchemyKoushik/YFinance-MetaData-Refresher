@@ -160,7 +160,13 @@ class RefreshService:
                     summary.total_api_calls += result.attempts
                     if isinstance(result, FetchFailure):
                         summary.failed += 1
-                        failure_company = CatalogCompany(ticker=result.ticker, company_name=result.catalog_company_name)
+                        failure_company = CatalogCompany(
+                            ticker=result.ticker,
+                            company_name=result.catalog_company_name,
+                            listing_country=result.listing_country,
+                            listing_region=result.listing_region,
+                            listing_exchange=result.listing_exchange,
+                        )
                         try:
                             await self.database.record_company_failure(
                                 failure_company,

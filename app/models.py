@@ -33,6 +33,12 @@ class CompanyMetadataRecord(BaseModel):
     company_name: str | None = None
     sector: str | None = None
     industry: str | None = None
+    listing_country: str | None = None
+    listing_region: str | None = None
+    listing_exchange: str | None = None
+    company_country: str | None = None
+    company_region: str | None = None
+    company_exchange: str | None = None
     country: str | None = None
     region: str | None = None
     exchange: str | None = None
